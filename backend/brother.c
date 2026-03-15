@@ -361,6 +361,7 @@ sane_open (SANE_String_Const name, SANE_Handle *h)
   dev->devcap.magic[0] = 0xC1;  /* Valid magic byte */
   
   dev->scanning = 0;
+  dev->page_count = 0;
   dev->startscan = 0;
 
   memset (dev->opt, 0, sizeof (dev->opt));
@@ -591,11 +592,11 @@ sane_get_parameters (SANE_Handle h, SANE_Parameters *parms)
   }
   else if (strcmp(mode, GRAY_STR)==0) {
     dev->colormode = BROTHER_COLOR_MODE_GRAY;
-    round = ~7;
+    round = ~15;
   }
   else {
     dev->colormode = BROTHER_COLOR_MODE_BW;
-    round = ~255;
+    round = ~7;
   }
   
   /* for now, preview is the same res as the request */
@@ -707,6 +708,26 @@ send_scan_command(BrotherMFC *dev)
     return SANE_STATUS_INVAL;
   }
 
+
+  /* For ADF pages 2+, send short next-page command instead of full scan */
+  if (dev->page_count > 0 && strcmp(dev->val[OPT_SOURCE].s, ADF_STR) == 0) {
+    char nextcmd[] = "\x1bX\n\x80";
+    len = 4;
+    DBG(2, "send_scan_command: ADF page %d, sending next-page command\n", dev->page_count);
+    status = device_write(dev, (SANE_Byte *)nextcmd, &len);
+    if (status != SANE_STATUS_GOOD) {
+      DBG(1, "send_scan_command: next-page command failed\n");
+      return SANE_STATUS_INVAL;
+    }
+    dev->startscan = 0;
+    dev->scan_lines = 0;
+    dev->readlen = sizeof(dev->readbuf);
+    dev->readi = 0;
+    dev->last_data_time = time(NULL);
+    dev->page_count++;
+    return SANE_STATUS_GOOD;
+  }
+
   /* Send I-command to negotiate scan parameters with scanner.
    * The original Brother driver sends this before the X-command
    * to set resolution and color mode. */
@@ -724,8 +745,8 @@ send_scan_command(BrotherMFC *dev)
     SANE_Byte ibuf[256];
     int retries;
     /* Retry reading the I-command response - scanner may need time */
-    for (retries = 0; retries < 10; retries++) {
-      usleep(200000);  /* 200ms between retries */
+    for (retries = 0; retries < 20; retries++) {
+      usleep(500000);  /* 500ms between retries */
       len = sizeof(ibuf);
       status = device_read(dev, ibuf, &len);
       if (status == SANE_STATUS_GOOD && len > 0) {
@@ -735,7 +756,7 @@ send_scan_command(BrotherMFC *dev)
 	break;
       }
     }
-    if (retries >= 10) {
+    if (retries >= 20) {
       DBG(1, "send_scan_command: no I-command response after retries\n");
     }
   }
@@ -791,51 +812,90 @@ send_scan_command(BrotherMFC *dev)
   dev->startscan = 0;
   dev->scan_lines = 0;  /* keep count of scanned lines */
   dev->adf_done = 0;    /* reset ADF status for new scan job */
+  dev->page_count++;
 
   /* init the data read buffer */
   dev->readlen = sizeof(dev->readbuf);
   dev->readi = 0;
-
-  /* Wait for scanner to start, then drain any command responses
-   * (I-command or X-command responses starting with ESC 0x1B)
-   * from the USB buffer before the scan data read loop begins. */
-  DBG(2, "send_scan_command: waiting for scanner to start\n");
-  sleep(3);
+  /* Wait for scanner to start, then drain command responses */
+  DBG(2, "send_scan_command: waiting for scanner (page %d)\n", dev->page_count);
+  if (dev->page_count <= 1) {
+    sleep(6);
 
   /* Drain command responses - read until we get scan data or nothing */
   {
-    SANE_Byte drain[4096];
+    SANE_Byte drain[32768];
     int drained = 0;
     int drain_retries;
+    size_t drain_total = 0;
     for (drain_retries = 0; drain_retries < 5; drain_retries++) {
-      len = sizeof(drain);
-      status = device_read(dev, drain, &len);
-      if (status != SANE_STATUS_GOOD || len == 0)
-	break;
+      size_t rlen = sizeof(drain) - drain_total;
+      if (rlen == 0) break;
+      status = device_read(dev, drain + drain_total, &rlen);
+      if (status != SANE_STATUS_GOOD || rlen == 0)
+        break;
       /* Check if this looks like a command response (starts with ESC) */
-      if (drain[0] == 0x1B) {
-	DBG(2, "send_scan_command: drained command response "
-	    "(%lu bytes)\n", (unsigned long)len);
-	drained += len;
-	usleep(100000);
-	continue;
+      if (drain_total == 0 && drain[0] == 0x1B) {
+        DBG(2, "send_scan_command: drained command response "
+            "(%lu bytes)\n", (unsigned long)rlen);
+        drained += rlen;
+        usleep(500000);
+        continue;
       }
-      /* This is scan data - put it in the read buffer */
-      DBG(2, "send_scan_command: got %lu bytes of scan data "
-	  "(first=0x%02x)\n", (unsigned long)len, drain[0]);
-      if (len <= sizeof(dev->readbuf)) {
-	memcpy(dev->readbuf, drain, len);
-	dev->readi = len;
-      }
-      break;
+      drain_total += rlen;
+      if (drain_total > 15000) break;
     }
-    if (drained > 0) {
-      DBG(2, "send_scan_command: drained %d bytes of command "
-	  "responses total\n", drained);
+
+    if (drain_total > 0 && dev->interleave == 1) {
+      /* Grayscale/BW: sync to record boundary to avoid 600dpi shearing */
+      unsigned int si;
+      int synced = 0;
+      unsigned int expected_bpl = dev->params.bytes_per_line;
+      unsigned int recsize = expected_bpl + 3;
+
+      for (si = 0; si + recsize + 3 <= drain_total; si++) {
+        if (!(drain[si] & 0x80)) {
+          unsigned int rc = drain[si+1] + drain[si+2]*256;
+          if (rc == expected_bpl) {
+            unsigned int next = si + recsize;
+            if (next + 3 <= drain_total && !(drain[next] & 0x80)) {
+              unsigned int rc2 = drain[next+1] + drain[next+2]*256;
+              if (rc2 == expected_bpl) {
+                unsigned int usable = drain_total - si;
+                if (usable > sizeof(dev->readbuf)) usable = sizeof(dev->readbuf);
+                memcpy(dev->readbuf, drain + si, usable);
+                dev->readi = usable;
+                synced = 1;
+                DBG(1, "send_scan_command: synced at offset %u, %u usable\n", si, usable);
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (!synced) {
+        /* Fallback: put data in readbuf as-is */
+        if (drain_total <= sizeof(dev->readbuf)) {
+          memcpy(dev->readbuf, drain, drain_total);
+          dev->readi = drain_total;
+        }
+        DBG(1, "send_scan_command: gray no sync, %u bytes in readbuf\n", (unsigned)drain_total);
+      }
+    } else if (drain_total > 0) {
+      /* Color: put drain data directly in readbuf (original behavior) */
+      if (drain_total <= sizeof(dev->readbuf)) {
+        memcpy(dev->readbuf, drain, drain_total);
+        dev->readi = drain_total;
+      }
+      DBG(1, "send_scan_command: %u bytes in readbuf\n", (unsigned)drain_total);
     }
   }
 
   dev->last_data_time = time(NULL);
+
+  } else {
+    usleep(500000);
+  }
 
   dev->logfile = fopen("/tmp/sane.raw", "wb");
 
@@ -885,72 +945,27 @@ process_buffer(BrotherMFC *dev, SANE_Byte *buf, SANE_Int maxlen)
   unsigned char * start;
 
   rechead = 3;  /* header is status byte, followed by length word */
-  /* Estimate per-record data size from SANE params.
-   * For color (interleave=3), each record holds one channel's worth
-   * of data, so divide bytes_per_line by interleave. */
-  {
-    unsigned int per_rec_data = dev->params.bytes_per_line / dev->interleave;
-    if (per_rec_data == 0) per_rec_data = 192;
-    reclen = (per_rec_data + rechead) * dev->interleave;
-  }
+  reclen = dev->params.pixels_per_line + rechead; /* add rec overhead */
+  reclen *= dev->interleave;   /* times number of bytes per pixel */
 
   /* are there records in the buffer already? */
   if (dev->readi > reclen) {
     start = dev->readbuf;
     /* now calculate the read record length from the first record */
     count = start[1] + start[2]*256;
-
-    /* Detect actual scan format: compare per-record data length against
-     * expected. For color (interleave=3), each record holds per-channel
-     * data (bytes_per_line/3). For B&W/gray (interleave=1), each record
-     * holds full bytes_per_line. */
-    if (count > 0 && dev->scan_lines == 0) {
-      unsigned int expected_per_rec =
-	dev->params.bytes_per_line / dev->interleave;
-      if (count != expected_per_rec) {
-	DBG(1, "process_buffer: record data %u bytes, expected %u "
-	    "(interleave=%u)\n", count, expected_per_rec,
-	    dev->interleave);
-	/* Check if scanner fell back to B&W (1-bit) mode:
-	 * B&W records are much smaller (width/8 bytes) compared
-	 * to color/gray (width bytes per channel) */
-	if (count < expected_per_rec / 2 && dev->params.depth == 8) {
-	  DBG(1, "process_buffer: detected B&W fallback, switching\n");
-	  dev->params.format = SANE_FRAME_GRAY;
-	  dev->params.depth = 1;
-	  dev->params.bytes_per_line = count;
-	  dev->params.pixels_per_line = count * 8;
-	  dev->interleave = 1;
-	} else {
-	  /* Scanner sent a different width than expected -
-	   * adjust params to match actual data */
-	  dev->params.bytes_per_line = count * dev->interleave;
-	  if (dev->params.depth == 8) {
-	    dev->params.pixels_per_line = count;
-	  } else {
-	    dev->params.pixels_per_line = count * 8;
-	  }
-	  DBG(1, "process_buffer: adjusted to %d pixels, %d bytes/line\n",
-	      dev->params.pixels_per_line, dev->params.bytes_per_line);
-	}
-      }
-    }
-
     reclen = count + rechead; /* add rec overhead */
     reclen *= dev->interleave;
-
+    
     /* how many complete records? (use integer math) */
     recnum = dev->readi / reclen;
-    /* do the records fit into the output buffer? */
-    if (recnum > (unsigned)maxlen / dev->params.bytes_per_line) {
-      recnum = (unsigned)maxlen / dev->params.bytes_per_line;
+    /* do the records fit into the buffer? */
+    if (recnum > (unsigned)maxlen / reclen) {
+      recnum = (unsigned)maxlen / reclen;
     }
-
-    /* now process individual scan lines. in full-color, each
-       line of output is composed of three lines: a line of
-       red, a line of green and a line of blue. these lines
-       must be merge into the format sane expects: a red value,
-       a green value and a blue value in sequence. */
+    
+    /* length of output records (take out headers) */
+    len = recnum * dev->params.bytes_per_line;
+    
     j = 0;
     for(k=0; k < recnum; k++) {
       /* read one line */
@@ -970,19 +985,14 @@ process_buffer(BrotherMFC *dev, SANE_Byte *buf, SANE_Int maxlen)
       dev->scan_lines++;
       start += bcount * dev->interleave;
     }
-
-    /* Use actual bytes consumed (start pointer advanced past processed
-       records) rather than estimated recnum * reclen, which is wrong
-       when the loop breaks early due to a status byte or zero-length
-       record */
-    len = k * dev->params.bytes_per_line;
-    count = start - dev->readbuf; /* actual bytes consumed from buffer */
+    
+    count = recnum * reclen; /* number of bytes we have processed */
     /* now copy the end of the buffer to the start */
-    memcpy(dev->readbuf,
-	   dev->readbuf + count,
+    memcpy(dev->readbuf, 
+	   dev->readbuf + count, 
 	   dev->readi - count + 1);
     dev->readi -= count;
-
+    
     return len;
   }
   
@@ -1054,6 +1064,7 @@ sane_read (SANE_Handle h, SANE_Byte *buf, SANE_Int maxlen, SANE_Int *lenp)
     if (status == SANE_STATUS_GOOD) {
       if (len > 0) {
 	dev->readi += len;
+        DBG(1, "sane_read: USB read %lu bytes at readi=%u, first 4: %02x %02x %02x %02x\n", (unsigned long)len, dev->readi - (unsigned)len, tmp[0], tmp[1], tmp[2], tmp[3]);
 	dev->last_data_time = time(NULL);
 	break;
       }
@@ -1090,7 +1101,7 @@ sane_read (SANE_Handle h, SANE_Byte *buf, SANE_Int maxlen, SANE_Int *lenp)
    * the scanner stops sending data without a status byte. */
   {
     time_t now = time(NULL);
-    if (now - dev->last_data_time >= 5) {
+    if (now - dev->last_data_time >= 60) {
       DBG(1, "sane_read: no data for %ld seconds, assuming end of document\n",
 	  (long)(now - dev->last_data_time));
       dev->adf_done = 1;

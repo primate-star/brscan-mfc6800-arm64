@@ -95,6 +95,7 @@ struct BrotherMFC {
   int scan_lines;
   time_t last_data_time;  /* tracks last successful data read for ADF timeout */
   int adf_done;           /* set when ADF has no more pages (0x80 received) */
+  int page_count;         /* page counter for ADF multi-page scans */
 
   struct brother_info devcap;
 
