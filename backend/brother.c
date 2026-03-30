@@ -596,7 +596,8 @@ sane_get_parameters (SANE_Handle h, SANE_Parameters *parms)
   }
   else {
     dev->colormode = BROTHER_COLOR_MODE_BW;
-    round = ~7;
+    round = ~7;  /* Use ~7 for 100-300 DPI, adjusted below for 600 */
+    if (dev->val[OPT_RESOLUTION].w >= 600) round = ~255;
   }
   
   /* for now, preview is the same res as the request */
@@ -709,22 +710,18 @@ send_scan_command(BrotherMFC *dev)
   }
 
 
-  /* For ADF pages 2+, send short next-page command instead of full scan */
+  /* ADF pages 2+: send short next-page command, skip full init */
   if (dev->page_count > 0 && strcmp(dev->val[OPT_SOURCE].s, ADF_STR) == 0) {
     char nextcmd[] = "\x1bX\n\x80";
     len = 4;
-    DBG(2, "send_scan_command: ADF page %d, sending next-page command\n", dev->page_count);
-    status = device_write(dev, (SANE_Byte *)nextcmd, &len);
-    if (status != SANE_STATUS_GOOD) {
-      DBG(1, "send_scan_command: next-page command failed\n");
-      return SANE_STATUS_INVAL;
-    }
+    DBG(2, "send_scan_command: ADF page %d next-page cmd\n", dev->page_count);
+    device_write(dev, (SANE_Byte *)nextcmd, &len);
     dev->startscan = 0;
     dev->scan_lines = 0;
     dev->readlen = sizeof(dev->readbuf);
     dev->readi = 0;
-    dev->last_data_time = time(NULL);
     dev->page_count++;
+    dev->last_data_time = time(NULL);
     return SANE_STATUS_GOOD;
   }
 
@@ -821,6 +818,9 @@ send_scan_command(BrotherMFC *dev)
   DBG(2, "send_scan_command: waiting for scanner (page %d)\n", dev->page_count);
   if (dev->page_count <= 1) {
     sleep(6);
+  } else {
+    usleep(500000);
+  }
 
   /* Drain command responses - read until we get scan data or nothing */
   {
@@ -893,9 +893,6 @@ send_scan_command(BrotherMFC *dev)
 
   dev->last_data_time = time(NULL);
 
-  } else {
-    usleep(500000);
-  }
 
   dev->logfile = fopen("/tmp/sane.raw", "wb");
 
