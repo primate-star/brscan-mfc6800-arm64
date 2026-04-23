@@ -1093,6 +1093,36 @@ sane_read (SANE_Handle h, SANE_Byte *buf, SANE_Int maxlen, SANE_Int *lenp)
   if (status != SANE_STATUS_GOOD)
     return status;
 
+  /* Orphan sentinel check: after the last data record of a page, the
+   * scanner emits 0x81 (next-page ready) or 0x80 (end-of-batch) as a
+   * single trailing byte. When the accumulated buffer ends with this
+   * byte but process_buffer could not consume it (bit 7 set mid-stream
+   * trips its record parser), we detect it here after a brief idle
+   * period. Narrow by design: only fires on exact 0x81/0x80 values,
+   * at the buffer tail, after 2+ seconds of no fresh data. Pixel data
+   * cannot match because actively-streaming reads reset last_data_time. */
+  {
+    time_t now_s = time(NULL);
+    if (dev->readi > 0 && (now_s - dev->last_data_time) >= 2) {
+      unsigned char tail = dev->readbuf[dev->readi - 1];
+      if (tail == 0x81) {
+        DBG(2, "sane_read: orphan 0x81 sentinel at offset %u (readi=%u), next page\n",
+            dev->readi - 1, dev->readi);
+        dev->params.last_frame = 1;
+        dev->readi = 0;
+        return SANE_STATUS_EOF;
+      }
+      if (tail == 0x80) {
+        DBG(2, "sane_read: orphan 0x80 sentinel at offset %u (readi=%u), end of batch\n",
+            dev->readi - 1, dev->readi);
+        dev->params.last_frame = 1;
+        dev->adf_done = 1;
+        dev->readi = 0;
+        return SANE_STATUS_EOF;
+      }
+    }
+  }
+
   /* Safety timeout: if no data has been received for 5 seconds,
    * assume end of document. This handles ADF end-of-feed when
    * the scanner stops sending data without a status byte. */

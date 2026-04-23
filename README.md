@@ -18,6 +18,11 @@ The Brother MFC-6800 is a late-1990s USB 1.1 multi-function device. Brother rele
 
 ### What Was Fixed
 
+**v3 (April 2026) — ADF lineart 300 DPI multi-page reliability**
+
+Previously, multi-page ADF scans at 300 DPI lineart would stop at a random page (typically 1-6) with a 60-second timeout, incorrectly reporting "Document feeder out of documents". The scanner emits a "next page ready" sentinel (0x81) as a 1-byte USB read that sometimes landed past a complete record boundary, where the existing end-of-page detection couldn't see it. Fixed by adding a narrow orphan-sentinel check that inspects the buffer tail after a brief idle period. Verified against Brother's original x86 Linux driver via usbmon protocol capture.
+
+
 **Original fixes (v1):**
 
 1. **`-Bsymbolic` linker flag** — Ensures the patched `sanei_usb` functions are used instead of the system SANE library's versions. Without this, the driver silently uses unpatched USB code at runtime and scans fail with corrupt output.
@@ -114,6 +119,11 @@ scanimage -d "brother:libusb:XXX:YYY" --source ADF --mode 'Black & White' --reso
 ```
 
 ## Known Limitations
+
+**Scanner firmware prioritizes ADF over Flatbed.** If paper is loaded in the ADF when a flatbed scan is requested, the MFC-6800 firmware will feed from the ADF anyway. This is 1999-era firmware behavior, not a driver issue — remove paper from the ADF to scan the flatbed.
+
+**Flatbed auto-scan after ADF batch (scanimage only).** When `scanimage --batch-count=N` is used with ADF and the feeder empties before reaching N pages, the driver may fall through to a flatbed scan on the next page request. Not an issue for scanservjs (which does not specify a fixed page count). Workaround: match `--batch-count` to the number of pages loaded.
+
 
 - **ADF lineart multi-page at 300 DPI**: May stop after several pages due to USB 1.1 timing sensitivity. Lineart data is very small and transfers quickly, leaving insufficient time for inter-page command processing. Use 100–200 DPI for reliable multi-page lineart ADF scanning, or use Grayscale mode at 300 DPI.
 - **600 DPI color scanning**: Slow over USB 1.1 (~2–3 minutes per page). This is a hardware bandwidth limitation, not a driver issue.
