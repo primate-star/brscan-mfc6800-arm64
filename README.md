@@ -5,7 +5,7 @@ compiled for ARM64 (aarch64) systems such as the Raspberry Pi 5 and Raspberry Pi
 
 ## Background
 
-The Brother MFC-6800 is a late-1990s USB 1.1 multi-function device. Brother released
+The Brother MFC-6800 is a early-2000's USB 1.1 multi-function device. Brother released
 open-source scanner driver code (`brscan-src-0.2.4`) but only for x86 systems. This
 project patches and compiles that driver for ARM64 Linux, bringing a 25+ year old scanner
 back to life on modern single-board computers.
