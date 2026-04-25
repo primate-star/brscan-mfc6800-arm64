@@ -96,7 +96,7 @@ The install script will:
 ## Web Interface (ScanServJS)
 
 ```bash
-apt install -y curl
+sudo apt install -y curl
 curl -s https://raw.githubusercontent.com/sbs20/scanservjs/master/bootstrap.sh | sudo bash -s -- -v latest
 ```
 
