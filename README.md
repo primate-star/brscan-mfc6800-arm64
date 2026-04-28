@@ -20,6 +20,18 @@ back to life on modern single-board computers.
 
 ## What Was Fixed
 
+**v3.1 (April 2026) — Color scan edge band eliminated**
+
+Color scans at 300 DPI and 600 DPI showed a visible dark band on one edge of the produced image — on the right edge for flatbed scans, on the left edge for ADF scans (ADF flips orientation). Lower resolutions (100/200) showed the same artifact but it blurred to near-invisible.
+
+Root cause: the MFC-6800's color sensor has an unsensed/uncalibrated region on the right side of its scan area. The driver was asking for the full 215.9mm physical width, which extended past the calibrated zone, producing dark or zero-valued pixels at the edge.
+
+Fix: clamp `x_br` in color mode to a per-resolution width derived from Brother's official x86 driver (`brscan-0.2.4`). Verified by capturing reference scans on a Vaio Ubuntu x86 system using `usbmon`, then probing the sensor empirically by shifting a fixed-width scan window left/right — confirming the dead zone lives on the right side of the physical sensor.
+
+Per-resolution maximum widths (matching Brother exactly): 200 DPI → 1632 px; 300 DPI → 2448 px; 600 DPI → 4912 px.
+
+User-specified scan regions via `-l` are still honored, so custom scan-area requests via `scanimage` work as expected.
+
 **v3 (April 2026) — ADF lineart 300 DPI multi-page reliability**
 
 Multi-page ADF scans at 300 DPI lineart would stop at a random page (typically 1–6) with

@@ -622,6 +622,32 @@ sane_get_parameters (SANE_Handle h, SANE_Parameters *parms)
   dev->x_tl &= round;
   dev->x_br &= round;
 
+  /* Color mode: the MFC-6800's color sensor has an unsensed region on
+   * the right side of its scan area that produces a dark edge band.
+   * Brother's official x86 driver (brscan-0.2.4) avoids this by limiting
+   * color scans to the leftmost 207.264mm (~8.16 in), not the full
+   * 215.9mm physical width. Verified empirically: shifting a fixed-width
+   * window rightward across the sensor produces progressively darker
+   * right-edge values. We clamp x_br to match Brother's per-resolution
+   * widths derived from Vaio + brscan-0.2.4 captures. x_tl is left alone
+   * so that user-specified scan regions (-l option) are still honored. */
+  if (dev->colormode == BROTHER_COLOR_MODE_RGB) {
+    unsigned int res = dev->val[OPT_RESOLUTION].w;
+    unsigned int max_x_br;
+    switch (res) {
+      case 100:  max_x_br =  816; break;
+      case 150:  max_x_br = 1224; break;
+      case 200:  max_x_br = 1632; break;
+      case 300:  max_x_br = 2448; break;
+      case 400:  max_x_br = 3266; break;
+      case 600:  max_x_br = 4912; break;
+      case 1200: max_x_br = 9824; break;
+      default:   max_x_br = (res * 8160 + 500) / 1000;
+    }
+    if (dev->x_br > max_x_br) dev->x_br = max_x_br;
+    dev->x_br &= round;
+  }
+
   /* width is the difference, but length is one less; at least
      that's the way it is for the MFC 6800 */
   dev->width = dev->x_br - dev->x_tl;
